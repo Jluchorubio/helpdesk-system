@@ -1,0 +1,10 @@
+{
+  "name": "@helpdesk/contracts",
+  "version": "0.0.1",
+  "description": "Shared event and API contracts",
+  "main": "index.js",
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}

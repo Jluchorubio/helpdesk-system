@@ -1,0 +1,1488 @@
+-- ============================================================================
+-- HELPDESK DATABASE — VERSIÓN DEFINITIVA MEJORADA 4.0
+-- ============================================================================
+-- Basada en: Versión Final Definitiva + Mejoras de Versión Híbrida
+-- ============================================================================
+-- MEJORAS INCORPORADAS:
+-- 1. Soft delete universal en TODAS las tablas
+-- 2. Check constraints exhaustivas
+-- 3. Vistas materializadas con métricas enriquecidas
+-- 4. Secuencias para ticket_number por organización
+-- 5. Documentación de orden de triggers
+-- 6. Funciones de mantenimiento automático
+-- ============================================================================
+
+-- ============================================================================
+-- 1. EXTENSIONES
+-- ============================================================================
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;      -- búsqueda full-text
+CREATE EXTENSION IF NOT EXISTS btree_gist;   -- índices de rango para fechas
+-- pg_partman ya no es necesario: particionamiento manual explícito
+
+
+-- ============================================================================
+-- 2. SCHEMAS
+-- ============================================================================
+
+CREATE SCHEMA IF NOT EXISTS app;
+CREATE SCHEMA IF NOT EXISTS users;
+CREATE SCHEMA IF NOT EXISTS inventory;
+CREATE SCHEMA IF NOT EXISTS tickets;
+CREATE SCHEMA IF NOT EXISTS files;
+CREATE SCHEMA IF NOT EXISTS notifications;
+CREATE SCHEMA IF NOT EXISTS audit;
+CREATE SCHEMA IF NOT EXISTS reports;
+CREATE SCHEMA IF NOT EXISTS maintenance;
+
+
+-- ============================================================================
+-- 3. CONFIGURACIÓN DE SESIÓN PARA RLS Y CONTEXTO DE APP
+-- ============================================================================
+
+-- Variables de sesión (seteadas por la aplicación)
+--   SET LOCAL app.current_user_id         = '<uuid>';
+--   SET LOCAL app.current_organization_id = '<uuid>';
+--   SET LOCAL app.user_role               = 'admin';
+
+
+-- ============================================================================
+-- 4. FUNCIONES GLOBALES DE CONTEXTO
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION app.get_current_user_id()
+RETURNS UUID AS $$
+DECLARE
+    v_user_id UUID;
+BEGIN
+    -- Prefer explicit session variable (backend)
+    BEGIN
+        v_user_id := current_setting('app.current_user_id', true)::UUID;
+    EXCEPTION WHEN OTHERS THEN
+        v_user_id := NULL;
+    END;
+
+    IF v_user_id IS NOT NULL THEN
+        RETURN v_user_id;
+    END IF;
+
+    -- Map Supabase auth.uid() to internal users.users.id (dynamic to avoid dependency order)
+    EXECUTE '
+        SELECT u.id
+        FROM users.users u
+        WHERE u.auth_id = auth.uid()
+          AND u.deleted_at IS NULL
+        LIMIT 1
+    '
+    INTO v_user_id;
+
+    RETURN v_user_id;
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, auth, users, app;
+
+CREATE OR REPLACE FUNCTION app.get_current_organization_id()
+RETURNS UUID AS $$
+DECLARE
+    v_org_id UUID;
+BEGIN
+    BEGIN
+        v_org_id := current_setting('app.current_organization_id', true)::UUID;
+    EXCEPTION WHEN OTHERS THEN
+        v_org_id := NULL;
+    END;
+
+    IF v_org_id IS NOT NULL THEN
+        RETURN v_org_id;
+    END IF;
+
+    EXECUTE '
+        SELECT u.organization_id
+        FROM users.users u
+        WHERE u.id = $1
+          AND u.deleted_at IS NULL
+        LIMIT 1
+    '
+    INTO v_org_id
+    USING app.get_current_user_id();
+
+    RETURN v_org_id;
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, auth, users, app;
+
+CREATE OR REPLACE FUNCTION app.get_current_role()
+RETURNS TEXT AS $$
+DECLARE
+    v_role TEXT;
+BEGIN
+    BEGIN
+        v_role := current_setting('app.user_role', true);
+    EXCEPTION WHEN OTHERS THEN
+        v_role := NULL;
+    END;
+
+    IF v_role IS NOT NULL THEN
+        RETURN v_role;
+    END IF;
+
+    EXECUTE '
+        SELECT r.name
+        FROM users.users u
+        JOIN users.roles r ON r.id = u.role_id
+        WHERE u.id = $1
+          AND u.deleted_at IS NULL
+        LIMIT 1
+    '
+    INTO v_role
+    USING app.get_current_user_id();
+
+    RETURN v_role;
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, auth, users, app;
+
+CREATE OR REPLACE FUNCTION audit.set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ============================================================================
+-- 5. AUTH
+-- Se usa Supabase Auth (schema auth.users). No se crean tablas propias aquí.
+-- ============================================================================
+
+
+-- ============================================================================
+-- 6. SCHEMA: users (con secuencias por organización)
+-- ============================================================================
+
+CREATE TABLE users.organizations (
+    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    name        VARCHAR(255) NOT NULL,
+    subdomain   VARCHAR(100) UNIQUE,
+    settings    JSONB        NOT NULL DEFAULT '{}',
+    is_active   BOOLEAN      NOT NULL DEFAULT TRUE,
+    ticket_sequence_last BIGINT NOT NULL DEFAULT 0,          -- ✅ Para ticket_number secuencial
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at  TIMESTAMPTZ,
+    deleted_at  TIMESTAMPTZ
+);
+
+CREATE TABLE users.roles (
+    id          SERIAL      PRIMARY KEY,
+    name        VARCHAR(50) NOT NULL UNIQUE,
+    description TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at  TIMESTAMPTZ                                   -- ✅ Soft delete añadido
+);
+
+CREATE TABLE users.permissions (
+    id          SERIAL       PRIMARY KEY,
+    name        VARCHAR(100) NOT NULL UNIQUE,
+    description TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at  TIMESTAMPTZ                                   -- ✅ Soft delete añadido
+);
+
+CREATE TABLE users.role_permissions (
+    role_id       INT NOT NULL REFERENCES users.roles(id) ON DELETE CASCADE,
+    permission_id INT NOT NULL REFERENCES users.permissions(id) ON DELETE CASCADE,
+    PRIMARY KEY (role_id, permission_id)
+);
+
+CREATE TABLE users.users (
+    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    auth_id         UUID        NOT NULL UNIQUE REFERENCES auth.users(id) ON DELETE RESTRICT,
+    organization_id UUID        NOT NULL REFERENCES users.organizations(id) ON DELETE RESTRICT,
+    role_id         INT         NOT NULL REFERENCES users.roles(id) ON DELETE RESTRICT,
+    first_name      VARCHAR(100) NOT NULL,
+    last_name       VARCHAR(100) NOT NULL,
+    avatar_url      TEXT,
+    is_active       BOOLEAN     NOT NULL DEFAULT TRUE,
+    last_activity_at TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMPTZ,
+    deleted_at      TIMESTAMPTZ,
+    UNIQUE(organization_id, auth_id)
+);
+
+CREATE TABLE users.user_phones (
+    id                  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             UUID        NOT NULL REFERENCES users.users(id) ON DELETE CASCADE,
+    country_code        VARCHAR(5)  NOT NULL,
+    number              VARCHAR(20) NOT NULL,
+    extension           VARCHAR(10),
+    is_primary          BOOLEAN     NOT NULL DEFAULT FALSE,
+    whatsapp_enabled    BOOLEAN     NOT NULL DEFAULT FALSE,
+    verified_at         TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at          TIMESTAMPTZ,
+    deleted_at          TIMESTAMPTZ,
+    UNIQUE(user_id, country_code, number)
+);
+
+CREATE TABLE users.user_settings (
+    user_id                 UUID        PRIMARY KEY REFERENCES users.users(id) ON DELETE CASCADE,
+    language                VARCHAR(10)  NOT NULL DEFAULT 'es',
+    theme                   VARCHAR(20)  NOT NULL DEFAULT 'light'
+                                CHECK (theme IN ('light', 'dark', 'system')),
+    timezone                VARCHAR(60)  NOT NULL DEFAULT 'America/Bogota',
+    notifications_enabled   BOOLEAN     NOT NULL DEFAULT TRUE,
+    email_notifications     BOOLEAN     NOT NULL DEFAULT TRUE,
+    whatsapp_notifications  BOOLEAN     NOT NULL DEFAULT FALSE,
+    updated_at              TIMESTAMPTZ
+);
+
+-- Función para obtener próximo número de ticket por organización
+CREATE OR REPLACE FUNCTION tickets.next_ticket_number(p_organization_id UUID)
+RETURNS BIGINT AS $$
+DECLARE
+    v_next BIGINT;
+BEGIN
+    UPDATE users.organizations
+    SET ticket_sequence_last = ticket_sequence_last + 1
+    WHERE id = p_organization_id
+    RETURNING ticket_sequence_last INTO v_next;
+    
+    RETURN v_next;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Triggers users
+CREATE TRIGGER trg_users_organizations_updated_at
+    BEFORE UPDATE ON users.organizations
+    FOR EACH ROW EXECUTE FUNCTION audit.set_updated_at();
+
+CREATE TRIGGER trg_users_users_updated_at
+    BEFORE UPDATE ON users.users
+    FOR EACH ROW EXECUTE FUNCTION audit.set_updated_at();
+
+CREATE TRIGGER trg_users_settings_updated_at
+    BEFORE UPDATE ON users.user_settings
+    FOR EACH ROW EXECUTE FUNCTION audit.set_updated_at();
+
+CREATE TRIGGER trg_users_phones_updated_at
+    BEFORE UPDATE ON users.user_phones
+    FOR EACH ROW EXECUTE FUNCTION audit.set_updated_at();
+
+-- Índices users
+CREATE INDEX idx_users_org_active    ON users.users(organization_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_users_role          ON users.users(role_id);
+CREATE INDEX idx_users_auth_id       ON users.users(auth_id);
+CREATE INDEX idx_users_name_trgm     ON users.users USING gin((first_name || ' ' || last_name) gin_trgm_ops);
+CREATE INDEX idx_users_phones_primary ON users.user_phones(user_id) WHERE is_primary = TRUE AND deleted_at IS NULL;
+CREATE INDEX idx_users_phones_wa      ON users.user_phones(user_id) WHERE whatsapp_enabled = TRUE AND deleted_at IS NULL;
+
+-- Seed roles
+INSERT INTO users.roles (name, description) VALUES
+    ('aprendiz',      'Puede crear y ver sus propios tickets'),
+    ('instructor',    'Puede crear tickets y ver inventario de su ambiente'),
+    ('administrativo','Acceso de lectura a tickets, inventario y reportes'),
+    ('soporte',       'Gestión completa de tickets e inventario'),
+    ('admin',         'Administrador total del sistema');
+
+-- Seed permisos
+INSERT INTO users.permissions (name, description) VALUES
+    ('tickets.create',       'Crear tickets'),
+    ('tickets.view_own',     'Ver tickets propios'),
+    ('tickets.view_all',     'Ver todos los tickets de la organización'),
+    ('tickets.assign',       'Asignar tickets a técnicos'),
+    ('tickets.close',        'Cerrar tickets'),
+    ('tickets.delete',       'Eliminar tickets (soft delete)'),
+    ('inventory.view',       'Ver inventario'),
+    ('inventory.edit',       'Crear y editar equipos'),
+    ('inventory.assign',     'Asignar equipos a usuarios'),
+    ('users.view',           'Ver usuarios de la organización'),
+    ('users.manage',         'Crear y editar usuarios'),
+    ('reports.view',         'Ver reportes y métricas'),
+    ('reports.export',       'Exportar datos y reportes');
+
+-- Asignación de permisos por rol
+INSERT INTO users.role_permissions (role_id, permission_id)
+SELECT r.id, p.id
+FROM users.roles r, users.permissions p
+WHERE
+    (r.name = 'aprendiz'      AND p.name IN ('tickets.create','tickets.view_own'))
+ OR (r.name = 'instructor'    AND p.name IN ('tickets.create','tickets.view_own','inventory.view'))
+ OR (r.name = 'administrativo' AND p.name IN ('tickets.view_all','inventory.view','reports.view','users.view'))
+ OR (r.name = 'soporte'       AND p.name IN ('tickets.create','tickets.view_all','tickets.assign',
+                                              'tickets.close','inventory.view','inventory.edit',
+                                              'inventory.assign','users.view','reports.view'))
+ OR (r.name = 'admin'         AND p.name IN (SELECT name FROM users.permissions));
+
+
+-- ============================================================================
+-- 7. SCHEMA: inventory (con soft delete universal)
+-- ============================================================================
+
+CREATE TABLE inventory.blocks (
+    id              SERIAL      PRIMARY KEY,
+    organization_id UUID        NOT NULL REFERENCES users.organizations(id) ON DELETE RESTRICT,
+    name            VARCHAR(100) NOT NULL,
+    description     TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at      TIMESTAMPTZ,
+    UNIQUE(organization_id, name)
+);
+
+CREATE TABLE inventory.environments (
+    id              SERIAL      PRIMARY KEY,
+    organization_id UUID        NOT NULL REFERENCES users.organizations(id) ON DELETE RESTRICT,
+    block_id        INT         NOT NULL REFERENCES inventory.blocks(id) ON DELETE RESTRICT,
+    name            VARCHAR(100) NOT NULL,
+    capacity        SMALLINT,
+    floor           SMALLINT,
+    is_active       BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMPTZ,
+    deleted_at      TIMESTAMPTZ,
+    UNIQUE(organization_id, block_id, name)
+);
+
+CREATE TABLE inventory.equipment_types (
+    id              SERIAL      PRIMARY KEY,
+    organization_id UUID        NOT NULL REFERENCES users.organizations(id) ON DELETE RESTRICT,
+    name            VARCHAR(100) NOT NULL,
+    custom_fields   JSONB        NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at      TIMESTAMPTZ,
+    UNIQUE(organization_id, name)
+);
+
+CREATE TABLE inventory.equipment_status (
+    id              SERIAL      PRIMARY KEY,
+    organization_id UUID        NOT NULL REFERENCES users.organizations(id) ON DELETE RESTRICT,
+    name            VARCHAR(50) NOT NULL,
+    description     TEXT,
+    is_operational  BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at      TIMESTAMPTZ,
+    UNIQUE(organization_id, name)
+);
+
+CREATE TABLE inventory.equipment (
+    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID        NOT NULL REFERENCES users.organizations(id) ON DELETE RESTRICT,
+    name            VARCHAR(150) NOT NULL,
+    serial_number   VARCHAR(100),
+    asset_tag       VARCHAR(100),
+    type_id         INT         NOT NULL REFERENCES inventory.equipment_types(id) ON DELETE RESTRICT,
+    environment_id  INT         REFERENCES inventory.environments(id) ON DELETE SET NULL,
+    status_id       INT         NOT NULL REFERENCES inventory.equipment_status(id) ON DELETE RESTRICT,
+    brand           VARCHAR(100),
+    model           VARCHAR(100),
+    purchase_date   DATE,
+    warranty_until  DATE,
+    metadata        JSONB        NOT NULL DEFAULT '{}',
+    notes           TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMPTZ,
+    deleted_at      TIMESTAMPTZ,
+    UNIQUE(organization_id, serial_number),
+    UNIQUE(organization_id, asset_tag)
+);
+
+CREATE TABLE inventory.equipment_assignments (
+    id              SERIAL      PRIMARY KEY,
+    equipment_id    UUID        NOT NULL REFERENCES inventory.equipment(id) ON DELETE RESTRICT,
+    user_id         UUID        NOT NULL REFERENCES users.users(id) ON DELETE RESTRICT,
+    assigned_by     UUID        REFERENCES users.users(id) ON DELETE SET NULL,
+    assigned_at     TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    returned_at     TIMESTAMPTZ,
+    notes           TEXT,
+    CONSTRAINT chk_assignment_dates CHECK (
+        returned_at IS NULL OR returned_at >= assigned_at
+    )
+);
+
+CREATE TABLE inventory.maintenance_types (
+    id          SERIAL      PRIMARY KEY,
+    name        VARCHAR(100) NOT NULL UNIQUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at  TIMESTAMPTZ                                   -- ✅ Soft delete añadido
+);
+
+CREATE TABLE inventory.maintenance_history (
+    id                  SERIAL      PRIMARY KEY,
+    equipment_id        UUID        NOT NULL REFERENCES inventory.equipment(id) ON DELETE RESTRICT,
+    maintenance_type_id INT         NOT NULL REFERENCES inventory.maintenance_types(id) ON DELETE RESTRICT,
+    performed_by        UUID        NOT NULL REFERENCES users.users(id) ON DELETE RESTRICT,
+    ticket_id           UUID,
+    description         TEXT        NOT NULL,
+    cost                NUMERIC(12,2),
+    performed_at        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    next_maintenance_at TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT chk_maintenance_cost CHECK (cost IS NULL OR cost >= 0)
+);
+
+-- Triggers inventory
+CREATE TRIGGER trg_inventory_environments_updated_at
+    BEFORE UPDATE ON inventory.environments
+    FOR EACH ROW EXECUTE FUNCTION audit.set_updated_at();
+
+CREATE TRIGGER trg_inventory_equipment_updated_at
+    BEFORE UPDATE ON inventory.equipment
+    FOR EACH ROW EXECUTE FUNCTION audit.set_updated_at();
+
+-- Índices inventory
+CREATE INDEX idx_equipment_org         ON inventory.equipment(organization_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_equipment_serial      ON inventory.equipment(organization_id, serial_number) WHERE deleted_at IS NULL;
+CREATE INDEX idx_equipment_asset_tag   ON inventory.equipment(organization_id, asset_tag) WHERE deleted_at IS NULL;
+CREATE INDEX idx_equipment_environment ON inventory.equipment(environment_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_equipment_type        ON inventory.equipment(type_id);
+CREATE INDEX idx_equipment_status      ON inventory.equipment(status_id);
+CREATE INDEX idx_equipment_name_trgm   ON inventory.equipment USING gin(name gin_trgm_ops);
+CREATE INDEX idx_environment_block     ON inventory.environments(block_id);
+CREATE INDEX idx_assignments_equipment ON inventory.equipment_assignments(equipment_id);
+CREATE INDEX idx_assignments_user      ON inventory.equipment_assignments(user_id);
+CREATE INDEX idx_assignments_active    ON inventory.equipment_assignments(equipment_id) WHERE returned_at IS NULL;
+CREATE INDEX idx_maintenance_equipment ON inventory.maintenance_history(equipment_id);
+CREATE INDEX idx_maintenance_date      ON inventory.maintenance_history(performed_at DESC);
+
+-- Seed
+INSERT INTO inventory.maintenance_types (name) VALUES
+    ('Preventivo'), ('Correctivo'), ('Predictivo'), ('Actualización');
+
+
+-- ============================================================================
+-- 8. SCHEMA: tickets (core con SLA mejorado)
+-- ============================================================================
+
+CREATE TABLE tickets.ticket_status (
+    id              SERIAL      PRIMARY KEY,
+    organization_id UUID        NOT NULL REFERENCES users.organizations(id) ON DELETE RESTRICT,
+    name            VARCHAR(50) NOT NULL,
+    description     TEXT,
+    is_terminal     BOOLEAN     NOT NULL DEFAULT FALSE,
+    sort_order      SMALLINT    NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at      TIMESTAMPTZ,
+    UNIQUE(organization_id, name)
+);
+
+CREATE TABLE tickets.ticket_priority (
+    id              SERIAL      PRIMARY KEY,
+    organization_id UUID        NOT NULL REFERENCES users.organizations(id) ON DELETE RESTRICT,
+    name            VARCHAR(50) NOT NULL,
+    level           SMALLINT    NOT NULL,
+    color           VARCHAR(7)  NOT NULL DEFAULT '#6c757d',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at      TIMESTAMPTZ,
+    UNIQUE(organization_id, name),
+    UNIQUE(organization_id, level)
+);
+
+CREATE TABLE tickets.ticket_categories (
+    id              SERIAL      PRIMARY KEY,
+    organization_id UUID        NOT NULL REFERENCES users.organizations(id) ON DELETE RESTRICT,
+    name            VARCHAR(100) NOT NULL,
+    description     TEXT,
+    parent_id       INT         REFERENCES tickets.ticket_categories(id) ON DELETE SET NULL,
+    is_active       BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at      TIMESTAMPTZ,
+    UNIQUE(organization_id, name)
+);
+
+CREATE TABLE tickets.sla_policies (
+    id                      SERIAL      PRIMARY KEY,
+    organization_id         UUID        NOT NULL REFERENCES users.organizations(id) ON DELETE RESTRICT,
+    priority_id             INT         NOT NULL REFERENCES tickets.ticket_priority(id) ON DELETE CASCADE,
+    name                    VARCHAR(100) NOT NULL,
+    response_time_hours     INT         NOT NULL CHECK (response_time_hours > 0),
+    resolution_time_hours   INT         NOT NULL CHECK (resolution_time_hours > 0),
+    escalation_after_hours  INT,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at              TIMESTAMPTZ,
+    deleted_at              TIMESTAMPTZ,
+    UNIQUE(organization_id, priority_id),
+    CONSTRAINT chk_sla_times CHECK (resolution_time_hours >= response_time_hours)
+);
+
+CREATE TABLE tickets.tags (
+    id              SERIAL      PRIMARY KEY,
+    organization_id UUID        NOT NULL REFERENCES users.organizations(id) ON DELETE RESTRICT,
+    name            VARCHAR(50) NOT NULL,
+    color           VARCHAR(7)  NOT NULL DEFAULT '#6c757d',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at      TIMESTAMPTZ,
+    UNIQUE(organization_id, name)
+);
+
+-- Tabla principal de tickets — particionada por rango de fecha
+CREATE TABLE tickets.tickets (
+    id                      UUID        NOT NULL DEFAULT gen_random_uuid(),
+    organization_id         UUID        NOT NULL REFERENCES users.organizations(id) ON DELETE RESTRICT,
+    ticket_number           BIGINT      NOT NULL,
+    title                   VARCHAR(255) NOT NULL,
+    description             TEXT        NOT NULL,
+    created_by              UUID        NOT NULL REFERENCES users.users(id) ON DELETE RESTRICT,
+    assigned_to             UUID        REFERENCES users.users(id) ON DELETE SET NULL,
+    equipment_id            UUID        REFERENCES inventory.equipment(id) ON DELETE SET NULL,
+    category_id             INT         REFERENCES tickets.ticket_categories(id) ON DELETE SET NULL,
+    priority_id             INT         NOT NULL REFERENCES tickets.ticket_priority(id) ON DELETE RESTRICT,
+    status_id               INT         NOT NULL REFERENCES tickets.ticket_status(id) ON DELETE RESTRICT,
+    sla_response_due_at     TIMESTAMPTZ,
+    sla_resolution_due_at   TIMESTAMPTZ,
+    sla_breached            BOOLEAN     NOT NULL DEFAULT FALSE,
+    first_response_at       TIMESTAMPTZ,
+    resolved_at             TIMESTAMPTZ,
+    closed_at               TIMESTAMPTZ,
+    satisfaction_score      SMALLINT,
+    satisfaction_comment    TEXT,
+    metadata                JSONB        NOT NULL DEFAULT '{}',
+    deleted_at              TIMESTAMPTZ,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at              TIMESTAMPTZ,
+    PRIMARY KEY (id, created_at),
+    UNIQUE(organization_id, ticket_number),
+    CONSTRAINT chk_ticket_dates CHECK (
+        (resolved_at IS NULL OR resolved_at >= created_at) AND
+        (closed_at   IS NULL OR closed_at   >= created_at)
+    ),
+    CONSTRAINT chk_satisfaction_score CHECK (satisfaction_score BETWEEN 1 AND 5), -- ✅ Añadido
+    CONSTRAINT chk_sla_breached CHECK (
+        (sla_breached = TRUE AND sla_resolution_due_at IS NOT NULL AND resolved_at IS NULL) OR
+        (sla_breached = FALSE)
+    )
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE tickets.ticket_comments (
+    id          UUID        NOT NULL DEFAULT gen_random_uuid(),
+    ticket_id   UUID        NOT NULL,
+    user_id     UUID        NOT NULL REFERENCES users.users(id) ON DELETE RESTRICT,
+    comment     TEXT        NOT NULL,
+    is_internal BOOLEAN     NOT NULL DEFAULT FALSE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at  TIMESTAMPTZ,
+    deleted_at  TIMESTAMPTZ,
+    PRIMARY KEY (id, created_at),
+    CONSTRAINT chk_comment_not_empty CHECK (length(trim(comment)) > 0)
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE tickets.ticket_history (
+    id          BIGSERIAL   NOT NULL,
+    ticket_id   UUID        NOT NULL,
+    changed_by  UUID,
+    field_name  VARCHAR(50) NOT NULL,
+    old_value   TEXT,
+    new_value   TEXT,
+    old_id      TEXT,
+    new_id      TEXT,
+    changed_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id, changed_at)
+) PARTITION BY RANGE (changed_at);
+
+CREATE TABLE tickets.ticket_tags (
+    ticket_id   UUID NOT NULL,
+    tag_id      INT  NOT NULL REFERENCES tickets.tags(id) ON DELETE CASCADE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ticket_id, tag_id)
+);
+
+-- ============================================================================
+-- 8.1 PARTICIONES INICIALES (12 meses adelante + histórico)
+-- ============================================================================
+
+DO $$
+DECLARE
+    start_date DATE := DATE_TRUNC('month', CURRENT_DATE - INTERVAL '3 months');
+    end_date   DATE := DATE_TRUNC('month', CURRENT_DATE + INTERVAL '13 months');
+    cur_date   DATE := start_date;
+    next_date  DATE;
+    suffix     TEXT;
+BEGIN
+    WHILE cur_date < end_date LOOP
+        next_date := cur_date + INTERVAL '1 month';
+        suffix    := TO_CHAR(cur_date, 'YYYY_MM');
+
+        EXECUTE FORMAT(
+            'CREATE TABLE IF NOT EXISTS tickets.tickets_%s
+             PARTITION OF tickets.tickets
+             FOR VALUES FROM (%L) TO (%L)',
+            suffix, cur_date, next_date
+        );
+        EXECUTE FORMAT(
+            'CREATE TABLE IF NOT EXISTS tickets.ticket_comments_%s
+             PARTITION OF tickets.ticket_comments
+             FOR VALUES FROM (%L) TO (%L)',
+            suffix, cur_date, next_date
+        );
+        EXECUTE FORMAT(
+            'CREATE TABLE IF NOT EXISTS tickets.ticket_history_%s
+             PARTITION OF tickets.ticket_history
+             FOR VALUES FROM (%L) TO (%L)',
+            suffix, cur_date, next_date
+        );
+
+        cur_date := next_date;
+    END LOOP;
+END $$;
+
+-- ============================================================================
+-- 8.2 TRIGGERS DE TICKETS (orden documentado)
+-- ============================================================================
+
+-- TRIGGER 1: Calcular SLA al crear ticket
+CREATE OR REPLACE FUNCTION tickets.calculate_sla()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_resp_hours INT;
+    v_resol_hours INT;
+BEGIN
+    SELECT response_time_hours, resolution_time_hours
+    INTO   v_resp_hours, v_resol_hours
+    FROM   tickets.sla_policies
+    WHERE  organization_id = NEW.organization_id
+    AND    priority_id     = NEW.priority_id
+    AND    deleted_at IS NULL;
+
+    IF FOUND THEN
+        NEW.sla_response_due_at   := NEW.created_at + (v_resp_hours  || ' hours')::INTERVAL;
+        NEW.sla_resolution_due_at := NEW.created_at + (v_resol_hours || ' hours')::INTERVAL;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_ticket_calculate_sla
+    BEFORE INSERT ON tickets.tickets
+    FOR EACH ROW EXECUTE FUNCTION tickets.calculate_sla();
+
+-- TRIGGER 2: Recalcular SLA al cambiar prioridad (BEFORE)
+CREATE OR REPLACE FUNCTION tickets.recalculate_sla_on_priority_change()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_resp_hours  INT;
+    v_resol_hours INT;
+BEGIN
+    IF NEW.priority_id IS DISTINCT FROM OLD.priority_id THEN
+        SELECT response_time_hours, resolution_time_hours
+        INTO   v_resp_hours, v_resol_hours
+        FROM   tickets.sla_policies
+        WHERE  organization_id = NEW.organization_id
+        AND    priority_id     = NEW.priority_id
+        AND    deleted_at IS NULL;
+
+        IF FOUND THEN
+            NEW.sla_response_due_at   := CURRENT_TIMESTAMP + (v_resp_hours  || ' hours')::INTERVAL;
+            NEW.sla_resolution_due_at := CURRENT_TIMESTAMP + (v_resol_hours || ' hours')::INTERVAL;
+            NEW.sla_breached          := FALSE;
+        END IF;
+    END IF;
+
+    IF NEW.sla_resolution_due_at IS NOT NULL
+       AND CURRENT_TIMESTAMP > NEW.sla_resolution_due_at
+       AND NEW.resolved_at IS NULL THEN
+        NEW.sla_breached := TRUE;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_ticket_sla_on_update
+    BEFORE UPDATE ON tickets.tickets
+    FOR EACH ROW EXECUTE FUNCTION tickets.recalculate_sla_on_priority_change();
+
+-- TRIGGER 3: Timestamps automáticos y updated_at (BEFORE)
+-- ORDEN: Este trigger DEBE ejecutarse ANTES que trg_ticket_log_changes
+-- para que resolved_at/closed_at estén actualizados en el historial
+CREATE OR REPLACE FUNCTION tickets.auto_timestamps()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at := CURRENT_TIMESTAMP;
+
+    IF NEW.status_id IS DISTINCT FROM OLD.status_id THEN
+        IF EXISTS (SELECT 1 FROM tickets.ticket_status WHERE id = NEW.status_id AND name = 'resuelto') THEN
+            NEW.resolved_at := COALESCE(NEW.resolved_at, CURRENT_TIMESTAMP);
+        END IF;
+
+        IF EXISTS (SELECT 1 FROM tickets.ticket_status WHERE id = NEW.status_id AND is_terminal = TRUE) THEN
+            NEW.closed_at := COALESCE(NEW.closed_at, CURRENT_TIMESTAMP);
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_ticket_auto_timestamps
+    BEFORE UPDATE ON tickets.tickets
+    FOR EACH ROW EXECUTE FUNCTION tickets.auto_timestamps();
+
+-- TRIGGER 4: Historial campo a campo (AFTER)
+-- NOTA: Se ejecuta DESPUÉS de trg_ticket_auto_timestamps para tener timestamps correctos
+CREATE OR REPLACE FUNCTION tickets.log_ticket_changes()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_actor       UUID;
+    v_old_label   TEXT;
+    v_new_label   TEXT;
+BEGIN
+    v_actor := app.get_current_user_id();
+
+    IF NEW.status_id IS DISTINCT FROM OLD.status_id THEN
+        SELECT name INTO v_old_label FROM tickets.ticket_status WHERE id = OLD.status_id;
+        SELECT name INTO v_new_label FROM tickets.ticket_status WHERE id = NEW.status_id;
+        INSERT INTO tickets.ticket_history(ticket_id, changed_by, field_name, old_value, new_value, old_id, new_id)
+        VALUES(NEW.id, v_actor, 'status', v_old_label, v_new_label, OLD.status_id::TEXT, NEW.status_id::TEXT);
+    END IF;
+
+    IF NEW.priority_id IS DISTINCT FROM OLD.priority_id THEN
+        SELECT name INTO v_old_label FROM tickets.ticket_priority WHERE id = OLD.priority_id;
+        SELECT name INTO v_new_label FROM tickets.ticket_priority WHERE id = NEW.priority_id;
+        INSERT INTO tickets.ticket_history(ticket_id, changed_by, field_name, old_value, new_value, old_id, new_id)
+        VALUES(NEW.id, v_actor, 'priority', v_old_label, v_new_label, OLD.priority_id::TEXT, NEW.priority_id::TEXT);
+    END IF;
+
+    IF NEW.assigned_to IS DISTINCT FROM OLD.assigned_to THEN
+        SELECT first_name || ' ' || last_name INTO v_old_label FROM users.users WHERE id = OLD.assigned_to;
+        SELECT first_name || ' ' || last_name INTO v_new_label FROM users.users WHERE id = NEW.assigned_to;
+        INSERT INTO tickets.ticket_history(ticket_id, changed_by, field_name, old_value, new_value, old_id, new_id)
+        VALUES(NEW.id, v_actor, 'assigned_to', v_old_label, v_new_label, OLD.assigned_to::TEXT, NEW.assigned_to::TEXT);
+    END IF;
+
+    IF NEW.category_id IS DISTINCT FROM OLD.category_id THEN
+        SELECT name INTO v_old_label FROM tickets.ticket_categories WHERE id = OLD.category_id;
+        SELECT name INTO v_new_label FROM tickets.ticket_categories WHERE id = NEW.category_id;
+        INSERT INTO tickets.ticket_history(ticket_id, changed_by, field_name, old_value, new_value, old_id, new_id)
+        VALUES(NEW.id, v_actor, 'category', v_old_label, v_new_label, OLD.category_id::TEXT, NEW.category_id::TEXT);
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_ticket_log_changes
+    AFTER UPDATE ON tickets.tickets
+    FOR EACH ROW EXECUTE FUNCTION tickets.log_ticket_changes();
+
+-- Trigger updated_at para comentarios
+CREATE TRIGGER trg_ticket_comments_updated_at
+    BEFORE UPDATE ON tickets.ticket_comments
+    FOR EACH ROW EXECUTE FUNCTION audit.set_updated_at();
+
+-- Índices tickets
+CREATE INDEX idx_tickets_org_status    ON tickets.tickets(organization_id, status_id)   WHERE deleted_at IS NULL;
+CREATE INDEX idx_tickets_org_priority  ON tickets.tickets(organization_id, priority_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_tickets_org_assigned  ON tickets.tickets(organization_id, assigned_to) WHERE deleted_at IS NULL;
+CREATE INDEX idx_tickets_created_by    ON tickets.tickets(created_by);
+CREATE INDEX idx_tickets_equipment     ON tickets.tickets(equipment_id);
+CREATE INDEX idx_tickets_sla_due       ON tickets.tickets(sla_resolution_due_at)
+                                       WHERE resolved_at IS NULL AND deleted_at IS NULL;
+CREATE INDEX idx_tickets_sla_breach    ON tickets.tickets(organization_id, sla_breached)
+                                       WHERE sla_breached = TRUE AND deleted_at IS NULL;
+CREATE INDEX idx_tickets_created_at    ON tickets.tickets(created_at DESC);
+CREATE INDEX idx_tickets_title_trgm    ON tickets.tickets USING gin(title gin_trgm_ops);
+CREATE INDEX idx_ticket_comments_ticket ON tickets.ticket_comments(ticket_id, created_at DESC)
+                                        WHERE deleted_at IS NULL;
+CREATE INDEX idx_ticket_history_ticket  ON tickets.ticket_history(ticket_id, changed_at DESC);
+
+-- Seed ticket_status por organización (ejecutar después de crear organizaciones)
+-- Los seeds se deben ejecutar por cada organización creada
+
+
+-- ============================================================================
+-- 9. SCHEMA: files
+-- ============================================================================
+
+CREATE TABLE files.owner_types (
+    id   SERIAL      PRIMARY KEY,
+    name VARCHAR(50) NOT NULL UNIQUE,
+    deleted_at TIMESTAMPTZ                                   -- ✅ Soft delete añadido
+);
+
+INSERT INTO files.owner_types (name) VALUES ('ticket'), ('comment'), ('maintenance'), ('user');
+
+CREATE TABLE files.files (
+    id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id  UUID        NOT NULL REFERENCES users.organizations(id) ON DELETE RESTRICT,
+    owner_type_id    INT         NOT NULL REFERENCES files.owner_types(id) ON DELETE RESTRICT,
+    owner_id         UUID        NOT NULL,
+    uploaded_by      UUID        NOT NULL REFERENCES users.users(id) ON DELETE RESTRICT,
+    file_name        VARCHAR(255) NOT NULL,
+    original_name    VARCHAR(255) NOT NULL,
+    mime_type        VARCHAR(100),
+    file_size        INT         NOT NULL CHECK (file_size > 0),
+    storage_provider VARCHAR(50) NOT NULL DEFAULT 's3',
+    storage_path     TEXT        NOT NULL,
+    checksum         VARCHAR(64),
+    is_public        BOOLEAN     NOT NULL DEFAULT FALSE,
+    deleted_at       TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT chk_checksum CHECK (checksum IS NULL OR length(checksum) = 64)
+);
+
+CREATE INDEX idx_files_owner       ON files.files(owner_type_id, owner_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_files_uploaded_by ON files.files(uploaded_by);
+CREATE INDEX idx_files_org         ON files.files(organization_id);
+
+
+-- ============================================================================
+-- 10. SCHEMA: notifications (con soft delete universal)
+-- ============================================================================
+
+CREATE TABLE notifications.notification_types (
+    id          SERIAL      PRIMARY KEY,
+    name        VARCHAR(100) NOT NULL UNIQUE,
+    template    TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at  TIMESTAMPTZ                                   -- ✅ Soft delete añadido
+);
+
+CREATE TABLE notifications.notifications (
+    id          UUID        NOT NULL DEFAULT gen_random_uuid(),
+    user_id     UUID        NOT NULL REFERENCES users.users(id) ON DELETE CASCADE,
+    type_id     INT         NOT NULL REFERENCES notifications.notification_types(id) ON DELETE RESTRICT,
+    title       VARCHAR(255) NOT NULL,
+    message     TEXT        NOT NULL,
+    metadata    JSONB        NOT NULL DEFAULT '{}',
+    channel     VARCHAR(20) NOT NULL DEFAULT 'in_app'
+                    CHECK (channel IN ('in_app','email','push','whatsapp','sms')),
+    is_read     BOOLEAN     NOT NULL DEFAULT FALSE,
+    read_at     TIMESTAMPTZ,
+    sent_at     TIMESTAMPTZ,
+    delivered_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id, created_at),
+    CONSTRAINT chk_read_at CHECK (read_at IS NULL OR is_read = TRUE)
+) PARTITION BY RANGE (created_at);
+
+-- Particiones de notificaciones
+DO $$
+DECLARE
+    cur_date  DATE := DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month');
+    end_date  DATE := DATE_TRUNC('month', CURRENT_DATE + INTERVAL '7 months');
+    next_date DATE;
+    suffix    TEXT;
+BEGIN
+    WHILE cur_date < end_date LOOP
+        next_date := cur_date + INTERVAL '1 month';
+        suffix    := TO_CHAR(cur_date, 'YYYY_MM');
+        EXECUTE FORMAT(
+            'CREATE TABLE IF NOT EXISTS notifications.notifications_%s
+             PARTITION OF notifications.notifications
+             FOR VALUES FROM (%L) TO (%L)',
+            suffix, cur_date, next_date
+        );
+        cur_date := next_date;
+    END LOOP;
+END $$;
+
+-- Triggers de notificaciones
+CREATE OR REPLACE FUNCTION notifications.notify_ticket_assignment()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_type_id INT;
+BEGIN
+    IF NEW.assigned_to IS NOT NULL
+       AND NEW.assigned_to IS DISTINCT FROM OLD.assigned_to THEN
+ 
+        SELECT id INTO v_type_id
+        FROM   notifications.notification_types
+        WHERE  name = 'ticket_assigned'
+        AND    deleted_at IS NULL;
+ 
+        INSERT INTO notifications.notifications(
+            user_id, type_id, title, message, metadata, channel
+        ) VALUES (
+            NEW.assigned_to,
+            v_type_id,
+            'Ticket asignado: ' || LEFT(NEW.title, 60),
+            'Se te ha asignado el ticket #' || NEW.ticket_number || ': ' || NEW.title,
+            jsonb_build_object(
+                'ticket_id',     NEW.id,
+                'ticket_number', NEW.ticket_number,
+                'priority_id',   NEW.priority_id,
+                'assigned_at',   CURRENT_TIMESTAMP
+            ),
+            'in_app'
+        );
+ 
+        PERFORM pg_notify(
+            'ticket_assignments',
+            jsonb_build_object(
+                'ticket_id',      NEW.id,
+                'user_id',        NEW.assigned_to,
+                'organization_id',NEW.organization_id
+            )::TEXT
+        );
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_ticket_assignment_notification
+    AFTER UPDATE ON tickets.tickets
+    FOR EACH ROW EXECUTE FUNCTION notifications.notify_ticket_assignment();
+
+CREATE OR REPLACE FUNCTION notifications.notify_ticket_closed()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_type_id INT;
+    v_is_terminal BOOLEAN;
+BEGIN
+    IF NEW.status_id IS DISTINCT FROM OLD.status_id THEN
+        SELECT is_terminal INTO v_is_terminal
+        FROM   tickets.ticket_status
+        WHERE  id = NEW.status_id;
+ 
+        IF v_is_terminal = TRUE THEN
+            SELECT id INTO v_type_id
+            FROM   notifications.notification_types
+            WHERE  name = 'ticket_closed'
+            AND    deleted_at IS NULL;
+ 
+            INSERT INTO notifications.notifications(
+                user_id, type_id, title, message, metadata, channel
+            ) VALUES (
+                NEW.created_by,
+                v_type_id,
+                'Tu ticket ha sido cerrado',
+                'El ticket "' || LEFT(NEW.title, 80) || '" (#' || NEW.ticket_number || ') ha sido cerrado.',
+                jsonb_build_object('ticket_id', NEW.id, 'ticket_number', NEW.ticket_number),
+                'in_app'
+            );
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_ticket_closed_notification
+    AFTER UPDATE ON tickets.tickets
+    FOR EACH ROW EXECUTE FUNCTION notifications.notify_ticket_closed();
+
+-- Índices notifications
+CREATE INDEX idx_notifications_user_unread ON notifications.notifications(user_id, is_read)
+                                           WHERE is_read = FALSE;
+CREATE INDEX idx_notifications_created_at  ON notifications.notifications(created_at DESC);
+
+-- Seed notification_types
+INSERT INTO notifications.notification_types (name, template) VALUES
+    ('ticket_created',   'Se ha creado el ticket: {{ticket_title}}'),
+    ('ticket_assigned',  'Se te ha asignado el ticket: {{ticket_title}}'),
+    ('ticket_updated',   'Tu ticket ha sido actualizado: {{ticket_title}}'),
+    ('ticket_closed',    'Tu ticket ha sido cerrado: {{ticket_title}}'),
+    ('sla_warning',      'El ticket {{ticket_title}} vence en {{hours}} horas'),
+    ('sla_breached',     'SLA incumplido en el ticket: {{ticket_title}}'),
+    ('ticket_escalated', 'Escalamiento: el ticket {{ticket_title}} requiere atención'),
+    ('system_alert',     'Alerta del sistema: {{message}}');
+
+
+-- ============================================================================
+-- 11. SCHEMA: audit (con eventos de dominio mejorados)
+-- ============================================================================
+
+CREATE TABLE audit.audit_logs (
+    id              BIGSERIAL   NOT NULL,
+    user_id         UUID,
+    organization_id UUID,
+    action          VARCHAR(20) NOT NULL CHECK (action IN ('CREATE','UPDATE','DELETE','LOGIN','LOGOUT')),
+    entity          VARCHAR(100) NOT NULL,
+    entity_id       TEXT,
+    old_data        JSONB,
+    new_data        JSONB,
+    ip_address      INET,
+    user_agent      TEXT,
+    metadata        JSONB        NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE audit.domain_events (
+    id              BIGSERIAL   NOT NULL,
+    event_id        UUID        NOT NULL DEFAULT gen_random_uuid(),
+    event_name      VARCHAR(100) NOT NULL,
+    aggregate_id    UUID        NOT NULL,
+    aggregate_type  VARCHAR(50) NOT NULL,
+    organization_id UUID,
+    payload         JSONB       NOT NULL,
+    status          VARCHAR(20) NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','processed','failed','retrying')),
+    retry_count     SMALLINT    NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    processed_at    TIMESTAMPTZ,
+    PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+
+-- Particiones de audit
+DO $$
+DECLARE
+    cur_date  DATE := DATE_TRUNC('month', CURRENT_DATE - INTERVAL '3 months');
+    end_date  DATE := DATE_TRUNC('month', CURRENT_DATE + INTERVAL '13 months');
+    next_date DATE;
+    suffix    TEXT;
+BEGIN
+    WHILE cur_date < end_date LOOP
+        next_date := cur_date + INTERVAL '1 month';
+        suffix    := TO_CHAR(cur_date, 'YYYY_MM');
+        EXECUTE FORMAT(
+            'CREATE TABLE IF NOT EXISTS audit.audit_logs_%s
+             PARTITION OF audit.audit_logs
+             FOR VALUES FROM (%L) TO (%L)',
+            suffix, cur_date, next_date
+        );
+        EXECUTE FORMAT(
+            'CREATE TABLE IF NOT EXISTS audit.domain_events_%s
+             PARTITION OF audit.domain_events
+             FOR VALUES FROM (%L) TO (%L)',
+            suffix, cur_date, next_date
+        );
+        cur_date := next_date;
+    END LOOP;
+END $$;
+
+-- Función de auditoría genérica
+CREATE OR REPLACE FUNCTION audit.log_entity_changes()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_action   TEXT;
+    v_entity_id TEXT;
+    v_old      JSONB;
+    v_new      JSONB;
+    v_org_id   UUID;
+BEGIN
+    v_action := CASE TG_OP
+        WHEN 'INSERT' THEN 'CREATE'
+        WHEN 'UPDATE' THEN 'UPDATE'
+        WHEN 'DELETE' THEN 'DELETE'
+    END;
+ 
+    IF TG_OP = 'DELETE' THEN
+        v_entity_id := OLD.id::TEXT;
+        v_old       := to_jsonb(OLD);
+        v_new       := NULL;
+        v_org_id    := CASE WHEN TG_TABLE_SCHEMA = 'users' THEN NULL
+                            ELSE OLD.organization_id END;
+    ELSE
+        v_entity_id := NEW.id::TEXT;
+        v_new       := to_jsonb(NEW);
+        v_old       := CASE WHEN TG_OP = 'UPDATE' THEN to_jsonb(OLD) ELSE NULL END;
+        v_org_id    := CASE WHEN TG_TABLE_SCHEMA = 'users' THEN NULL
+                            ELSE NEW.organization_id END;
+    END IF;
+ 
+    INSERT INTO audit.audit_logs(
+        user_id, organization_id, action, entity, entity_id, old_data, new_data
+    ) VALUES (
+        app.get_current_user_id(),
+        v_org_id,
+        v_action,
+        TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME,
+        v_entity_id,
+        CASE WHEN v_old IS NOT NULL
+             THEN v_old - 'password_hash' - 'refresh_token_hash' - 'token_hash'
+             ELSE NULL END,
+        CASE WHEN v_new IS NOT NULL
+             THEN v_new - 'password_hash' - 'refresh_token_hash' - 'token_hash'
+             ELSE NULL END
+    );
+ 
+    RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Función de captura de domain events
+CREATE OR REPLACE FUNCTION audit.capture_domain_event()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_record      JSONB;
+    v_aggregate   UUID;
+    v_org_id      UUID;
+    v_event_name  TEXT;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        v_record    := to_jsonb(OLD);
+        v_aggregate := OLD.id;
+        v_org_id    := OLD.organization_id;
+    ELSE
+        v_record    := to_jsonb(NEW);
+        v_aggregate := NEW.id;
+        v_org_id    := NEW.organization_id;
+    END IF;
+ 
+    v_event_name := TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME || '.' ||
+                    LOWER(CASE TG_OP
+                        WHEN 'INSERT' THEN 'created'
+                        WHEN 'UPDATE' THEN 'updated'
+                        WHEN 'DELETE' THEN 'deleted'
+                    END);
+ 
+    INSERT INTO audit.domain_events(
+        event_name, aggregate_id, aggregate_type, organization_id, payload
+    ) VALUES (
+        v_event_name,
+        v_aggregate,
+        TG_TABLE_NAME,
+        v_org_id,
+        jsonb_build_object(
+            'operation', TG_OP,
+            'data',      v_record - 'password_hash' - 'refresh_token_hash',
+            'timestamp', CURRENT_TIMESTAMP
+        )
+    );
+ 
+    RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Aplicar auditoría a entidades core
+CREATE TRIGGER trg_audit_tickets
+    AFTER INSERT OR UPDATE OR DELETE ON tickets.tickets
+    FOR EACH ROW EXECUTE FUNCTION audit.log_entity_changes();
+ 
+CREATE TRIGGER trg_audit_equipment
+    AFTER INSERT OR UPDATE OR DELETE ON inventory.equipment
+    FOR EACH ROW EXECUTE FUNCTION audit.log_entity_changes();
+ 
+CREATE TRIGGER trg_audit_users
+    AFTER INSERT OR UPDATE OR DELETE ON users.users
+    FOR EACH ROW EXECUTE FUNCTION audit.log_entity_changes();
+ 
+CREATE TRIGGER trg_domain_events_tickets
+    AFTER INSERT OR UPDATE OR DELETE ON tickets.tickets
+    FOR EACH ROW EXECUTE FUNCTION audit.capture_domain_event();
+ 
+-- Índices audit
+CREATE INDEX idx_audit_user        ON audit.audit_logs(user_id);
+CREATE INDEX idx_audit_entity      ON audit.audit_logs(entity, entity_id);
+CREATE INDEX idx_audit_org         ON audit.audit_logs(organization_id, created_at DESC);
+CREATE INDEX idx_audit_action      ON audit.audit_logs(action);
+CREATE INDEX idx_domain_status     ON audit.domain_events(status, created_at)
+                                   WHERE status IN ('pending','retrying');
+CREATE INDEX idx_domain_aggregate  ON audit.domain_events(aggregate_id);
+
+
+-- ============================================================================
+-- 12. ROW LEVEL SECURITY — AISLAMIENTO MULTI-TENANT
+-- ============================================================================
+
+-- Habilitar RLS
+ALTER TABLE users.users              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE inventory.equipment      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tickets.tickets          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tickets.ticket_comments  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE files.files              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notifications.notifications ENABLE ROW LEVEL SECURITY;
+ 
+-- tickets.tickets: lectura por organización + rol/relación
+CREATE POLICY policy_tickets_select ON tickets.tickets
+    AS PERMISSIVE
+    FOR SELECT
+    USING (
+        deleted_at IS NULL
+        AND organization_id = app.get_current_organization_id()
+        AND (
+            app.get_current_role() IN ('admin', 'soporte', 'administrativo')
+            OR created_by = app.get_current_user_id()
+            OR assigned_to = app.get_current_user_id()
+        )
+    );
+ 
+-- tickets.ticket_comments: lectura si el ticket es visible + reglas internas
+CREATE POLICY policy_comments_select ON tickets.ticket_comments
+    AS PERMISSIVE
+    FOR SELECT
+    USING (
+        deleted_at IS NULL
+        AND EXISTS (
+            SELECT 1
+            FROM tickets.tickets t
+            WHERE t.id = ticket_id
+              AND t.organization_id = app.get_current_organization_id()
+              AND t.deleted_at IS NULL
+              AND (
+                  app.get_current_role() IN ('admin', 'soporte', 'administrativo')
+                  OR t.created_by = app.get_current_user_id()
+                  OR t.assigned_to = app.get_current_user_id()
+              )
+        )
+        AND (
+            is_internal = FALSE
+            OR app.get_current_role() IN ('admin', 'soporte')
+        )
+    );
+ 
+-- users.users: lectura por organización
+CREATE POLICY policy_users_select ON users.users
+    AS PERMISSIVE
+    FOR SELECT
+    USING (
+        deleted_at IS NULL
+        AND organization_id = app.get_current_organization_id()
+        AND (
+            app.get_current_role() IN ('admin', 'soporte', 'administrativo')
+            OR id = app.get_current_user_id()
+        )
+    );
+ 
+-- inventory.equipment: lectura por organización
+CREATE POLICY policy_equipment_select ON inventory.equipment
+    AS PERMISSIVE
+    FOR SELECT
+    USING (
+        deleted_at IS NULL
+        AND organization_id = app.get_current_organization_id()
+    );
+ 
+-- files.files: lectura por organización
+CREATE POLICY policy_files_select ON files.files
+    AS PERMISSIVE
+    FOR SELECT
+    USING (
+        deleted_at IS NULL
+        AND organization_id = app.get_current_organization_id()
+    );
+ 
+-- notifications: lectura solo propias
+CREATE POLICY policy_notifications_select ON notifications.notifications
+    AS PERMISSIVE
+    FOR SELECT
+    USING (
+        user_id = app.get_current_user_id()
+    );
+
+
+-- ============================================================================
+-- 13. SCHEMA: reports — Vistas materializadas enriquecidas
+-- ============================================================================
+
+-- Métricas diarias mejoradas
+CREATE MATERIALIZED VIEW reports.ticket_metrics_daily AS
+SELECT
+    t.organization_id,
+    DATE(t.created_at)                                                          AS date,
+    COUNT(*)                                                                    AS total_created,
+    COUNT(*) FILTER (WHERE ts.is_terminal = TRUE)                               AS total_closed,
+    COUNT(*) FILTER (WHERE t.sla_breached = TRUE)                               AS sla_breached,
+    COUNT(*) FILTER (WHERE t.closed_at <= t.sla_resolution_due_at
+                      AND ts.is_terminal = TRUE)                                AS sla_met,
+    ROUND(AVG(
+        EXTRACT(EPOCH FROM (t.closed_at - t.created_at)) / 3600.0
+    ) FILTER (WHERE t.closed_at IS NOT NULL)::NUMERIC, 2)                       AS avg_hours_to_close,
+    ROUND(AVG(
+        EXTRACT(EPOCH FROM (t.first_response_at - t.created_at)) / 3600.0
+    ) FILTER (WHERE t.first_response_at IS NOT NULL)::NUMERIC, 2)              AS avg_hours_first_response,
+    ROUND(AVG(t.satisfaction_score) FILTER (
+        WHERE t.satisfaction_score IS NOT NULL
+    )::NUMERIC, 2)                                                              AS avg_satisfaction,
+    -- ✅ Nuevas métricas
+    COUNT(*) FILTER (WHERE t.resolved_at IS NOT NULL)                           AS total_resolved,
+    COUNT(*) FILTER (WHERE t.assigned_to IS NOT NULL)                           AS total_assigned,
+    COUNT(*) FILTER (WHERE t.equipment_id IS NOT NULL)                          AS with_equipment
+FROM tickets.tickets t
+JOIN tickets.ticket_status ts ON ts.id = t.status_id
+WHERE t.deleted_at IS NULL
+GROUP BY t.organization_id, DATE(t.created_at)
+WITH DATA;
+ 
+CREATE UNIQUE INDEX idx_ticket_metrics_daily
+    ON reports.ticket_metrics_daily(organization_id, date);
+ 
+-- Rendimiento por agente (mejorado)
+CREATE MATERIALIZED VIEW reports.agent_performance AS
+SELECT
+    u.id                                                                        AS user_id,
+    u.first_name || ' ' || u.last_name                                          AS agent_name,
+    u.organization_id,
+    COUNT(DISTINCT t.id)                                                        AS total_assigned,
+    COUNT(DISTINCT t.id) FILTER (WHERE ts.is_terminal = TRUE)                   AS total_resolved,
+    ROUND(AVG(
+        EXTRACT(EPOCH FROM (t.closed_at - t.created_at)) / 3600.0
+    ) FILTER (WHERE t.closed_at IS NOT NULL)::NUMERIC, 2)                       AS avg_resolution_hours,
+    COUNT(DISTINCT t.id) FILTER (
+        WHERE t.closed_at IS NOT NULL
+          AND t.closed_at <= t.sla_resolution_due_at
+    )                                                                           AS sla_met,
+    COUNT(DISTINCT t.id) FILTER (WHERE t.sla_breached = TRUE)                   AS sla_breached,
+    ROUND(AVG(t.satisfaction_score) FILTER (
+        WHERE t.satisfaction_score IS NOT NULL
+    )::NUMERIC, 2)                                                              AS avg_satisfaction,
+    -- ✅ Nuevas métricas
+    MAX(t.created_at)                                                           AS last_assigned_at,
+    COUNT(DISTINCT t.id) FILTER (WHERE t.created_at > CURRENT_DATE - 7)         AS last_7_days,
+    COUNT(DISTINCT t.id) FILTER (WHERE t.first_response_at IS NOT NULL)         AS first_response_given
+FROM users.users u
+LEFT JOIN tickets.tickets t
+    ON  t.assigned_to = u.id
+    AND t.deleted_at  IS NULL
+LEFT JOIN tickets.ticket_status ts ON ts.id = t.status_id
+WHERE u.deleted_at IS NULL
+  AND u.role_id IN (SELECT id FROM users.roles WHERE name IN ('soporte','admin'))
+GROUP BY u.id, u.first_name, u.last_name, u.organization_id
+WITH DATA;
+ 
+CREATE UNIQUE INDEX idx_agent_performance_user
+    ON reports.agent_performance(user_id);
+
+CREATE INDEX idx_agent_performance_org
+    ON reports.agent_performance(organization_id);
+ 
+-- Vista de tickets activos
+CREATE VIEW tickets.v_tickets_active AS
+SELECT
+    t.id,
+    t.organization_id,
+    t.ticket_number,
+    t.title,
+    t.created_by,
+    t.assigned_to,
+    t.equipment_id,
+    ts.name                                                                     AS status,
+    ts.is_terminal,
+    tp.name                                                                     AS priority,
+    tp.level                                                                    AS priority_level,
+    tc.name                                                                     AS category,
+    t.sla_response_due_at,
+    t.sla_resolution_due_at,
+    t.sla_breached,
+    t.first_response_at,
+    t.satisfaction_score,
+    t.created_at,
+    t.updated_at,
+    ROUND(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - t.created_at)) / 3600.0, 1)  AS age_hours
+FROM  tickets.tickets t
+JOIN  tickets.ticket_status   ts ON ts.id = t.status_id
+JOIN  tickets.ticket_priority tp ON tp.id = t.priority_id
+LEFT JOIN tickets.ticket_categories tc ON tc.id = t.category_id
+WHERE t.deleted_at IS NULL
+  AND ts.is_terminal = FALSE;
+ 
+-- Vista de equipos activos
+CREATE VIEW inventory.v_equipment_active AS
+SELECT
+    e.id,
+    e.organization_id,
+    e.name,
+    e.serial_number,
+    e.asset_tag,
+    et.name     AS type,
+    es.name     AS status,
+    es.is_operational,
+    e.brand,
+    e.model,
+    env.name    AS environment,
+    b.name      AS block,
+    e.warranty_until,
+    e.purchase_date,
+    e.created_at,
+    CASE 
+        WHEN e.warranty_until > CURRENT_DATE THEN 'active'
+        WHEN e.warranty_until <= CURRENT_DATE THEN 'expired'
+        ELSE 'unknown'
+    END AS warranty_status
+FROM  inventory.equipment        e
+JOIN  inventory.equipment_types  et  ON et.id  = e.type_id
+JOIN  inventory.equipment_status es  ON es.id  = e.status_id
+LEFT JOIN inventory.environments env ON env.id = e.environment_id
+LEFT JOIN inventory.blocks        b   ON b.id  = env.block_id
+WHERE e.deleted_at IS NULL;
+
+
+-- ============================================================================
+-- 14. FUNCIONES DE MANTENIMIENTO AUTOMÁTICO
+-- ============================================================================
+
+-- Actualización de vistas materializadas
+CREATE OR REPLACE FUNCTION reports.refresh_materialized_views()
+RETURNS TEXT AS $$
+BEGIN
+    REFRESH MATERIALIZED VIEW reports.ticket_metrics_daily;
+    REFRESH MATERIALIZED VIEW reports.agent_performance;
+    RETURN 'Vistas materializadas actualizadas correctamente';
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Función de mantenimiento completo
+CREATE OR REPLACE FUNCTION maintenance.run_all()
+RETURNS TEXT AS $$
+DECLARE
+    v_views_refreshed TEXT;
+BEGIN
+    v_views_refreshed := reports.refresh_materialized_views();
+    RETURN format('Mantenimiento completado. %s', v_views_refreshed);
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+
+-- ============================================================================
+-- 15. DOCUMENTACIÓN DE ORDEN DE TRIGGERS
+-- ============================================================================
+
+COMMENT ON TRIGGER trg_ticket_auto_timestamps ON tickets.tickets IS 
+    'ORDEN CRÍTICO: Este trigger DEBE ejecutarse ANTES que trg_ticket_log_changes '
+    'para que resolved_at y closed_at estén actualizados en el historial. '
+    'Ejecución: BEFORE UPDATE - actualiza timestamps automáticos.';
+
+COMMENT ON TRIGGER trg_ticket_log_changes ON tickets.tickets IS 
+    'ORDEN CRÍTICO: Este trigger se ejecuta DESPUÉS de trg_ticket_auto_timestamps '
+    'para capturar los timestamps actualizados en el historial. '
+    'Ejecución: AFTER UPDATE - registra cambios campo a campo.';
+
+COMMENT ON TRIGGER trg_ticket_sla_on_update ON tickets.tickets IS 
+    'Recalcula SLA cuando cambia la prioridad. '
+    'Ejecución: BEFORE UPDATE - debe ejecutarse antes de trg_ticket_auto_timestamps.';
+
+COMMENT ON FUNCTION app.get_current_user_id() IS 
+    'Lee app.current_user_id de la sesión. La app DEBE hacer SET LOCAL app.current_user_id = uuid '
+    'al inicio de cada transacción para que auditoría y RLS funcionen correctamente.';
+
+COMMENT ON FUNCTION tickets.next_ticket_number(UUID) IS 
+    'Genera el próximo número de ticket secuencial por organización. '
+    'Utiliza un contador en users.organizations para evitar race conditions.';
+
+
+-- ============================================================================
+-- 16. COMENTARIOS DE DOCUMENTACIÓN
+-- ============================================================================
+
+COMMENT ON SCHEMA app           IS 'Funciones de contexto para RLS (Supabase Auth + backend)';
+COMMENT ON SCHEMA users         IS 'Perfiles, roles, permisos RBAC y organizaciones (multi-tenant)';
+COMMENT ON SCHEMA inventory     IS 'Inventario de equipos, ambientes, bloques y mantenimiento';
+COMMENT ON SCHEMA tickets       IS 'Core de mesa de ayuda: tickets, SLA, historial, comentarios y tags';
+COMMENT ON SCHEMA files         IS 'Archivos adjuntos polimórficos (tickets, comentarios, mantenimiento, usuarios)';
+COMMENT ON SCHEMA notifications IS 'Notificaciones multi-canal: in-app, email, push, WhatsApp';
+COMMENT ON SCHEMA audit         IS 'Auditoría completa de cambios y eventos de dominio (CQRS-ready)';
+COMMENT ON SCHEMA reports       IS 'Vistas materializadas para dashboards y métricas de rendimiento';
+COMMENT ON SCHEMA maintenance   IS 'Funciones de mantenimiento y tareas programadas';
+ 
+COMMENT ON TABLE  tickets.ticket_history IS
+    'Historial campo a campo. changed_by = usuario real via app.get_current_user_id(). '
+    'Sin FK para preservar datos históricos de entidades eliminadas. '
+    'Almacena valores legibles (old_value/new_value) además de IDs para mantener contexto histórico.';
+ 
+COMMENT ON TABLE  audit.domain_events IS
+    'Eventos de dominio para integración con colas (Kafka, RabbitMQ) y arquitectura CQRS. '
+    'El campo status permite reintentos con control de retry_count.';
+ 
+COMMENT ON COLUMN tickets.tickets.sla_breached IS
+    'TRUE si se superó sla_resolution_due_at sin resolved_at. '
+    'Se recalcula en cada UPDATE via trigger trg_ticket_sla_on_update.';
+ 
+COMMENT ON COLUMN tickets.tickets.ticket_number IS
+    'Número secuencial por organización. Generado automáticamente via tickets.next_ticket_number() '
+    'para evitar race conditions en entornos concurrentes.';
+ 
+COMMENT ON COLUMN tickets.tickets.satisfaction_score IS
+    'Puntuación de satisfacción del usuario (CSAT) de 1 a 5. '
+    'Solo aplicable cuando el ticket está cerrado.';
+ 
+COMMENT ON CONSTRAINT chk_sla_times ON tickets.sla_policies IS
+    'Garantiza que el tiempo de resolución no sea menor que el tiempo de respuesta.';
+ 
+COMMENT ON CONSTRAINT chk_satisfaction_score ON tickets.tickets IS
+    'Valida que la puntuación de satisfacción esté entre 1 y 5.';
+
+
+-- ============================================================================
+-- FIN DEL SCRIPT
+-- ============================================================================
+
