@@ -1,5 +1,5 @@
 -- ============================================================================
--- HELPDESK DATABASE — VERSIÓN DEFINITIVA MEJORADA 4.0
+-- HELPDESK DATABASE — VERSIÓN DEFINITIVA MEJORADA 4.1
 -- ============================================================================
 -- Basada en: Versión Final Definitiva + Mejoras de Versión Híbrida
 -- ============================================================================
@@ -10,6 +10,9 @@
 -- 4. Secuencias para ticket_number por organización
 -- 5. Documentación de orden de triggers
 -- 6. Funciones de mantenimiento automático
+-- 7. ✅ CORRECCIÓN: Función app.get_current_role() añadida
+-- 8. ✅ CORRECCIÓN: Políticas DENY explícitas para escritura
+-- 9. ✅ CORRECCIÓN: Trigger automático para config por organización
 -- ============================================================================
 
 -- ============================================================================
@@ -115,6 +118,7 @@ RETURNS TEXT AS $$
 DECLARE
     v_role TEXT;
 BEGIN
+    -- Prioridad 1: Variable de sesión (backend)
     BEGIN
         v_role := current_setting('app.user_role', true);
     EXCEPTION WHEN OTHERS THEN
@@ -125,6 +129,7 @@ BEGIN
         RETURN v_role;
     END IF;
 
+    -- Prioridad 2: De la base de datos (frontend con Supabase)
     EXECUTE '
         SELECT r.name
         FROM users.users u
@@ -513,6 +518,54 @@ CREATE TABLE tickets.tags (
     UNIQUE(organization_id, name)
 );
 
+-- ✅ NUEVO: Trigger automático para crear configuración por defecto al crear organización
+CREATE OR REPLACE FUNCTION users.create_default_ticket_config()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Estados por defecto
+    INSERT INTO tickets.ticket_status (organization_id, name, description, is_terminal, sort_order) VALUES
+        (NEW.id, 'abierto', 'Ticket recién creado, sin atender', FALSE, 1),
+        (NEW.id, 'en_proceso', 'Ticket asignado y siendo atendido', FALSE, 2),
+        (NEW.id, 'en_espera', 'Esperando respuesta del solicitante', FALSE, 3),
+        (NEW.id, 'resuelto', 'Solución aplicada, pendiente confirmación', FALSE, 4),
+        (NEW.id, 'cerrado', 'Ticket finalizado y confirmado', TRUE, 5),
+        (NEW.id, 'cancelado', 'Ticket anulado', TRUE, 6);
+    
+    -- Prioridades por defecto
+    INSERT INTO tickets.ticket_priority (organization_id, name, level, color) VALUES
+        (NEW.id, 'baja', 1, '#28a745'),
+        (NEW.id, 'media', 2, '#ffc107'),
+        (NEW.id, 'alta', 3, '#fd7e14'),
+        (NEW.id, 'urgente', 4, '#dc3545');
+    
+    -- SLA Policies por defecto
+    INSERT INTO tickets.sla_policies (organization_id, priority_id, name, response_time_hours, resolution_time_hours)
+    SELECT NEW.id, tp.id, 'SLA ' || tp.name,
+        CASE tp.name
+            WHEN 'baja' THEN 24
+            WHEN 'media' THEN 8
+            WHEN 'alta' THEN 4
+            WHEN 'urgente' THEN 1
+        END,
+        CASE tp.name
+            WHEN 'baja' THEN 72
+            WHEN 'media' THEN 24
+            WHEN 'alta' THEN 8
+            WHEN 'urgente' THEN 4
+        END
+    FROM tickets.ticket_priority tp
+    WHERE tp.organization_id = NEW.id;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ✅ NUEVO: Trigger para crear configuración por defecto al crear organización
+CREATE TRIGGER trg_create_default_ticket_config
+    AFTER INSERT ON users.organizations
+    FOR EACH ROW
+    EXECUTE FUNCTION users.create_default_ticket_config();
+
 -- Tabla principal de tickets — particionada por rango de fecha
 CREATE TABLE tickets.tickets (
     id                      UUID        NOT NULL DEFAULT gen_random_uuid(),
@@ -539,7 +592,6 @@ CREATE TABLE tickets.tickets (
     created_at              TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at              TIMESTAMPTZ,
     PRIMARY KEY (id, created_at),
-    UNIQUE(organization_id, ticket_number),
     CONSTRAINT chk_ticket_dates CHECK (
         (resolved_at IS NULL OR resolved_at >= created_at) AND
         (closed_at   IS NULL OR closed_at   >= created_at)
@@ -772,6 +824,8 @@ CREATE TRIGGER trg_ticket_comments_updated_at
 CREATE INDEX idx_tickets_org_status    ON tickets.tickets(organization_id, status_id)   WHERE deleted_at IS NULL;
 CREATE INDEX idx_tickets_org_priority  ON tickets.tickets(organization_id, priority_id) WHERE deleted_at IS NULL;
 CREATE INDEX idx_tickets_org_assigned  ON tickets.tickets(organization_id, assigned_to) WHERE deleted_at IS NULL;
+CREATE INDEX idx_tickets_org_ticket_number ON tickets.tickets(organization_id, ticket_number)
+                                       WHERE deleted_at IS NULL;
 CREATE INDEX idx_tickets_created_by    ON tickets.tickets(created_by);
 CREATE INDEX idx_tickets_equipment     ON tickets.tickets(equipment_id);
 CREATE INDEX idx_tickets_sla_due       ON tickets.tickets(sla_resolution_due_at)
@@ -1186,6 +1240,16 @@ CREATE POLICY policy_tickets_select ON tickets.tickets
             OR assigned_to = app.get_current_user_id()
         )
     );
+
+-- ✅ NUEVO: Políticas DENY explícitas para escritura en tickets
+CREATE POLICY policy_tickets_insert_deny ON tickets.tickets
+    FOR INSERT WITH CHECK (false);
+
+CREATE POLICY policy_tickets_update_deny ON tickets.tickets
+    FOR UPDATE USING (false);
+
+CREATE POLICY policy_tickets_delete_deny ON tickets.tickets
+    FOR DELETE USING (false);
  
 -- tickets.ticket_comments: lectura si el ticket es visible + reglas internas
 CREATE POLICY policy_comments_select ON tickets.ticket_comments
@@ -1210,6 +1274,16 @@ CREATE POLICY policy_comments_select ON tickets.ticket_comments
             OR app.get_current_role() IN ('admin', 'soporte')
         )
     );
+
+-- ✅ NUEVO: Políticas DENY explícitas para escritura en comentarios
+CREATE POLICY policy_comments_insert_deny ON tickets.ticket_comments
+    FOR INSERT WITH CHECK (false);
+
+CREATE POLICY policy_comments_update_deny ON tickets.ticket_comments
+    FOR UPDATE USING (false);
+
+CREATE POLICY policy_comments_delete_deny ON tickets.ticket_comments
+    FOR DELETE USING (false);
  
 -- users.users: lectura por organización
 CREATE POLICY policy_users_select ON users.users
@@ -1223,6 +1297,16 @@ CREATE POLICY policy_users_select ON users.users
             OR id = app.get_current_user_id()
         )
     );
+
+-- ✅ NUEVO: Políticas DENY explícitas para escritura en usuarios
+CREATE POLICY policy_users_insert_deny ON users.users
+    FOR INSERT WITH CHECK (false);
+
+CREATE POLICY policy_users_update_deny ON users.users
+    FOR UPDATE USING (false);
+
+CREATE POLICY policy_users_delete_deny ON users.users
+    FOR DELETE USING (false);
  
 -- inventory.equipment: lectura por organización
 CREATE POLICY policy_equipment_select ON inventory.equipment
@@ -1232,6 +1316,16 @@ CREATE POLICY policy_equipment_select ON inventory.equipment
         deleted_at IS NULL
         AND organization_id = app.get_current_organization_id()
     );
+
+-- ✅ NUEVO: Políticas DENY explícitas para escritura en equipos
+CREATE POLICY policy_equipment_insert_deny ON inventory.equipment
+    FOR INSERT WITH CHECK (false);
+
+CREATE POLICY policy_equipment_update_deny ON inventory.equipment
+    FOR UPDATE USING (false);
+
+CREATE POLICY policy_equipment_delete_deny ON inventory.equipment
+    FOR DELETE USING (false);
  
 -- files.files: lectura por organización
 CREATE POLICY policy_files_select ON files.files
@@ -1241,6 +1335,16 @@ CREATE POLICY policy_files_select ON files.files
         deleted_at IS NULL
         AND organization_id = app.get_current_organization_id()
     );
+
+-- ✅ NUEVO: Políticas DENY explícitas para escritura en archivos
+CREATE POLICY policy_files_insert_deny ON files.files
+    FOR INSERT WITH CHECK (false);
+
+CREATE POLICY policy_files_update_deny ON files.files
+    FOR UPDATE USING (false);
+
+CREATE POLICY policy_files_delete_deny ON files.files
+    FOR DELETE USING (false);
  
 -- notifications: lectura solo propias
 CREATE POLICY policy_notifications_select ON notifications.notifications
@@ -1249,6 +1353,16 @@ CREATE POLICY policy_notifications_select ON notifications.notifications
     USING (
         user_id = app.get_current_user_id()
     );
+
+-- ✅ NUEVO: Políticas DENY explícitas para escritura en notificaciones
+CREATE POLICY policy_notifications_insert_deny ON notifications.notifications
+    FOR INSERT WITH CHECK (false);
+
+CREATE POLICY policy_notifications_update_deny ON notifications.notifications
+    FOR UPDATE USING (false);
+
+CREATE POLICY policy_notifications_delete_deny ON notifications.notifications
+    FOR DELETE USING (false);
 
 
 -- ============================================================================
@@ -1485,4 +1599,3 @@ COMMENT ON CONSTRAINT chk_satisfaction_score ON tickets.tickets IS
 -- ============================================================================
 -- FIN DEL SCRIPT
 -- ============================================================================
-
