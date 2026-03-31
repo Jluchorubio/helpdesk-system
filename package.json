@@ -1,0 +1,22 @@
+{
+  "name": "helpdesk-system",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "apps/*",
+    "services/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "echo \"run services individually\"",
+    "build": "echo \"build all services\""
+  },
+  "devDependencies": {
+    "typescript": "^6.0.2"
+  },
+  "dependencies": {
+    "amqplib": "^1.0.2",
+    "dotenv": "^17.3.1",
+    "pg": "^8.20.0"
+  }
+}
